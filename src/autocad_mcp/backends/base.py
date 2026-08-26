@@ -100,6 +100,10 @@ class AutoCADBackend(ABC):
     async def execute_lisp(self, code: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def batch(self, commands: list[dict]) -> CommandResult:
+        """Run many whitelisted commands in one round-trip / undo group."""
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     # --- Entity operations ---
 
     async def create_line(self, x1: float, y1: float, x2: float, y2: float, layer: str | None = None) -> CommandResult:

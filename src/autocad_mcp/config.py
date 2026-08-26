@@ -23,6 +23,14 @@ IPC_TIMEOUT = max(1.0, min(300.0, float(os.environ.get("AUTOCAD_MCP_IPC_TIMEOUT"
 # Screenshot
 ONLY_TEXT_FEEDBACK = os.environ.get("AUTOCAD_MCP_ONLY_TEXT", "").lower() in ("1", "true", "yes")
 
+# Max screenshot width in pixels — downscale bigger captures to save tokens/context.
+# Set to 0 to disable downscaling. Clamped to [320, 4096].
+try:
+    _shot_w = int(os.environ.get("AUTOCAD_MCP_SCREENSHOT_MAX_WIDTH", "1400"))
+except ValueError:
+    _shot_w = 1400
+SCREENSHOT_MAX_WIDTH = 0 if _shot_w <= 0 else max(320, min(4096, _shot_w))
+
 # Win32 availability
 WIN32_AVAILABLE = sys.platform == "win32"
 

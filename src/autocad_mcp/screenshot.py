@@ -16,6 +16,22 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 
+def _downscale(img):
+    """Shrink a PIL image to SCREENSHOT_MAX_WIDTH to cut base64 size (token cost).
+
+    Returns the image unchanged when downscaling is disabled or not needed.
+    """
+    from autocad_mcp.config import SCREENSHOT_MAX_WIDTH
+
+    if not SCREENSHOT_MAX_WIDTH or img.width <= SCREENSHOT_MAX_WIDTH:
+        return img
+    from PIL import Image
+
+    ratio = SCREENSHOT_MAX_WIDTH / float(img.width)
+    new_size = (SCREENSHOT_MAX_WIDTH, max(1, int(img.height * ratio)))
+    return img.resize(new_size, Image.LANCZOS)
+
+
 class ScreenshotProvider(ABC):
     """Abstract screenshot provider."""
 
@@ -187,8 +203,10 @@ class Win32ScreenshotProvider(ScreenshotProvider):
                     1,
                 )
 
+                img = _downscale(img)
+
                 buf = io.BytesIO()
-                img.save(buf, format="PNG")
+                img.save(buf, format="PNG", optimize=True)
                 buf.seek(0)
                 return base64.b64encode(buf.read()).decode("ascii")
             finally:

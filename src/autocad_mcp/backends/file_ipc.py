@@ -61,6 +61,7 @@ class FileIPCBackend(AutoCADBackend):
         self._command_hwnd: int | None = None
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
+        self._acad_com = None  # COM handle for full AutoCAD (preferred trigger)
         self._lock = asyncio.Lock()  # Single in-flight command
 
     @property
@@ -99,6 +100,11 @@ class FileIPCBackend(AutoCADBackend):
         # Find command-line child edit control for focus-free dispatch
         self._command_hwnd = self._find_command_line_hwnd()
         log.info("command_line_hwnd", hwnd=self._command_hwnd)
+
+        # Full AutoCAD (non-LT) exposes a COM automation object. Using
+        # ActiveDocument.SendCommand is far more reliable than posting WM_CHAR
+        # to the command line, which silently fails on AutoCAD 2025.
+        self._acquire_com()
 
         # Ensure IPC directory exists
         self._ipc_dir.mkdir(parents=True, exist_ok=True)
@@ -213,12 +219,40 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             return None
 
-    def _type_dispatch_trigger(self):
-        """Post '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
+    def _acquire_com(self):
+        """Try to grab the running full-AutoCAD COM object (None on LT/failure)."""
+        if sys.platform != "win32":
+            return
+        try:
+            import pythoncom  # noqa: F401  (ensures COM is initialized in this thread)
+            import win32com.client
 
-        Sends ESC keystrokes first to cancel any stale pending command
-        (e.g. from a previous timeout leaving AutoCAD in a command prompt).
+            self._acad_com = win32com.client.GetActiveObject("AutoCAD.Application")
+            log.info("com_acquired", name=str(self._acad_com.Name))
+        except Exception as e:
+            self._acad_com = None
+            log.info("com_unavailable", error=str(e))
+
+    def _type_dispatch_trigger(self):
+        """Trigger '(c:mcp-dispatch)' in AutoCAD.
+
+        Prefers COM ActiveDocument.SendCommand (reliable on full AutoCAD).
+        Falls back to posting WM_CHAR to the command line for LT, which has
+        no COM automation interface.
         """
+        # Preferred path: COM SendCommand (full AutoCAD)
+        if self._acad_com is not None:
+            try:
+                import pythoncom
+
+                pythoncom.CoInitialize()
+                self._acad_com.ActiveDocument.SendCommand("(c:mcp-dispatch) ")
+                return
+            except Exception as e:
+                log.error("com_dispatch_failed", error=str(e))
+                self._acad_com = None  # fall through to WM_CHAR
+
+        # Fallback path: post keystrokes to the command line (AutoCAD LT)
         try:
             import ctypes
 
@@ -247,7 +281,7 @@ class FileIPCBackend(AutoCADBackend):
         """Remove stale IPC files from previous sessions."""
         try:
             now = time.time()
-            for pattern in ("autocad_mcp_*.json", "autocad_mcp_*.tmp", "autocad_mcp_lisp_*.lsp"):
+            for pattern in ("autocad_mcp_*.json", "autocad_mcp_*.tmp", "autocad_mcp_lisp_*.lsp", "autocad_mcp_batch_*.txt"):
                 for f in self._ipc_dir.glob(pattern):
                     if now - f.stat().st_mtime > STALE_THRESHOLD:
                         f.unlink(missing_ok=True)
@@ -307,6 +341,41 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("execute-lisp", {
             "code_file": str(code_file).replace("\\", "/")
         })
+
+    async def batch(self, commands: list[dict]) -> CommandResult:
+        """Run many whitelisted commands in one dispatch, wrapped in one UNDO group.
+
+        Each item: {"command": "<dispatcher-name>", "params": {...}}, e.g.
+        {"command": "create-line", "params": {"x1": 0, "y1": 0, "x2": 100, "y2": 0}}.
+        Commands are written to a tab-delimited file (one per line) and executed
+        by the LISP 'batch' handler. json.dumps keeps text ASCII-safe (\\uXXXX),
+        which the dispatcher decodes to AutoCAD Unicode.
+        """
+        if not commands:
+            return CommandResult(ok=False, error="commands list is empty")
+
+        request_id = uuid.uuid4().hex[:12]
+        batch_file = self._ipc_dir / f"autocad_mcp_batch_{request_id}.txt"
+        lines = []
+        for c in commands:
+            cmd = c.get("command")
+            if not cmd:
+                continue
+            params = {k: v for k, v in (c.get("params") or {}).items() if v is not None}
+            # json.dumps has no literal tabs/newlines (they are escaped), so a
+            # tab is a safe field separator and one command == one line.
+            lines.append(f"{cmd}\t{json.dumps(params)}")
+
+        batch_file.write_text("\n".join(lines), encoding="utf-8")
+        try:
+            return await self._dispatch("batch", {
+                "batch_file": str(batch_file).replace("\\", "/")
+            })
+        finally:
+            try:
+                batch_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # --- Entity operations ---
 

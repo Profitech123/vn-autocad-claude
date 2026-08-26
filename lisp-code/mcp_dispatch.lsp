@@ -1,4 +1,4 @@
-;;; mcp_dispatch.lsp — File-based IPC dispatcher for AutoCAD MCP v3.1
+;;; mcp_dispatch.lsp — File-based IPC dispatcher for AutoCAD MCP v3.2
 ;;;
 ;;; Protocol:
 ;;;   1. Python writes command JSON to C:/temp/autocad_mcp_cmd_{id}.json
@@ -147,6 +147,50 @@
   )
 )
 
+(defun mcp-json-unescape (s / out i n ch nxt hex)
+  "Decode JSON string escapes for AutoCAD text.
+   Key fix: \\uXXXX (JSON, e.g. Vietnamese) -> \\U+XXXX (AutoCAD Unicode control code)."
+  (if (null s) (setq s ""))
+  (setq out "" i 1 n (strlen s))
+  (while (<= i n)
+    (setq ch (substr s i 1))
+    (if (and (= ch "\\") (< i n))
+      (progn
+        (setq nxt (substr s (1+ i) 1))
+        (cond
+          ((= nxt "u")
+           (setq hex (substr s (+ i 2) 4))
+           (setq out (strcat out "\\U+" (strcase hex)))
+           (setq i (+ i 6)))
+          ((= nxt "n") (setq out (strcat out " ")) (setq i (+ i 2)))
+          ((= nxt "t") (setq out (strcat out " ")) (setq i (+ i 2)))
+          ((= nxt "r") (setq i (+ i 2)))
+          ((= nxt "/") (setq out (strcat out "/")) (setq i (+ i 2)))
+          ((= nxt "\"") (setq out (strcat out "\"")) (setq i (+ i 2)))
+          ((= nxt "\\") (setq out (strcat out "\\")) (setq i (+ i 2)))
+          (t (setq out (strcat out nxt)) (setq i (+ i 2)))
+        )
+      )
+      (progn (setq out (strcat out ch)) (setq i (1+ i)))
+    )
+  )
+  out
+)
+
+(defun mcp-ensure-vn-style ( / )
+  "Create a Unicode-capable text style (Arial TTF) so \\U+XXXX glyphs render.
+   Idempotent: only creates MCP_VN once."
+  (if (not (tblsearch "STYLE" "MCP_VN"))
+    (entmake
+      (list (cons 0 "STYLE") (cons 100 "AcDbSymbolTableRecord")
+            (cons 100 "AcDbTextStyleTableRecord") (cons 2 "MCP_VN")
+            (cons 70 0) (cons 40 0.0) (cons 41 1.0) (cons 50 0.0)
+            (cons 71 0) (cons 42 2.5) (cons 3 "arial.ttf") (cons 4 ""))
+    )
+  )
+  "MCP_VN"
+)
+
 ;; -----------------------------------------------------------------------
 ;; String splitting utility (used by semicolon-delimited encodings)
 ;; -----------------------------------------------------------------------
@@ -177,6 +221,10 @@
     ;; --- Freehand LISP execution ---
     ((= cmd-name "execute-lisp")
      (mcp-cmd-execute-lisp params-json))
+
+    ;; --- Batch (multiple whitelisted commands in one UNDO group) ---
+    ((= cmd-name "batch")
+     (mcp-cmd-batch params-json))
 
     ;; --- Undo / Redo ---
     ((= cmd-name "undo")
@@ -536,10 +584,10 @@
   (cons T (strcat "{\"entity_type\":\"LWPOLYLINE\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
-(defun mcp-cmd-create-text (params / x y text height rotation layer)
+(defun mcp-cmd-create-text (params / x y text height rotation layer old-style has-uni)
   (setq x (mcp-json-get-number params "x"))
   (setq y (mcp-json-get-number params "y"))
-  (setq text (mcp-json-get-string params "text"))
+  (setq text (mcp-json-unescape (mcp-json-get-string params "text")))
   (setq height (mcp-json-get-number params "height"))
   (setq rotation (mcp-json-get-number params "rotation"))
   (if (not height) (setq height 2.5))
@@ -548,7 +596,14 @@
   (if layer
     (progn (ensure_layer_exists layer "white" "CONTINUOUS") (set_current_layer layer))
   )
+  ;; Accented/Unicode text needs a TTF style to render (SHX fonts show "?").
+  (setq has-uni (and text (vl-string-search "\\U+" text)))
+  (if has-uni
+    (progn (mcp-ensure-vn-style)
+           (setq old-style (getvar "TEXTSTYLE"))
+           (setvar "TEXTSTYLE" "MCP_VN")))
   (command "_TEXT" "J" "M" (list x y 0.0) height rotation text)
+  (if has-uni (setvar "TEXTSTYLE" old-style))
   (cons T (strcat "{\"entity_type\":\"TEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
@@ -635,6 +690,46 @@
           (cons T (strcat "\"" (mcp-escape-string (vl-princ-to-string result)) "\""))
         )
       )
+    )
+  )
+)
+
+;; --- Batch execution (many commands, one UNDO group) ---
+
+(defun mcp-cmd-batch (params / batch-file fp line tab-pos cmd pjson res okc errc errs)
+  "Run multiple whitelisted commands from a tab-delimited file in one UNDO group.
+   Each line: <command-name>\t<params-json>. Reuses mcp-dispatch-command so the
+   security whitelist still applies. Returns counts + a short error digest."
+  (setq batch-file (mcp-json-get-string params "batch_file"))
+  (if (or (not batch-file) (not (findfile batch-file)))
+    (cons nil "batch_file not found")
+    (progn
+      (setq fp (open batch-file "r") okc 0 errc 0 errs "")
+      (command "_.UNDO" "_BEGIN")
+      (while (setq line (read-line fp))
+        (if (> (strlen line) 0)
+          (progn
+            (setq tab-pos (vl-string-search "\t" line))
+            (if tab-pos
+              (progn
+                (setq cmd (substr line 1 tab-pos))
+                (setq pjson (substr line (+ tab-pos 2)))
+                (setq res (vl-catch-all-apply 'mcp-dispatch-command (list cmd pjson)))
+                (if (or (vl-catch-all-error-p res) (null (car res)))
+                  (progn
+                    (setq errc (1+ errc))
+                    (if (< (strlen errs) 300)
+                      (setq errs (strcat errs (if (> (strlen errs) 0) "; " "") cmd))))
+                  (setq okc (1+ okc)))
+              )
+            )
+          )
+        )
+      )
+      (command "_.UNDO" "_END")
+      (close fp)
+      (cons T (strcat "{\"ok_count\":" (itoa okc) ",\"error_count\":" (itoa errc)
+                      ",\"errors\":\"" (mcp-escape-string errs) "\"}"))
     )
   )
 )
@@ -810,16 +905,22 @@
   (cons T (strcat "{\"entity_type\":\"ELLIPSE\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
-(defun mcp-cmd-create-mtext (params / x y width text height layer)
+(defun mcp-cmd-create-mtext (params / x y width text height layer old-style has-uni)
   (setq x (mcp-json-get-number params "x"))
   (setq y (mcp-json-get-number params "y"))
   (setq width (mcp-json-get-number params "width"))
-  (setq text (mcp-json-get-string params "text"))
+  (setq text (mcp-json-unescape (mcp-json-get-string params "text")))
   (setq height (mcp-json-get-number params "height"))
   (if (not height) (setq height 2.5))
   (setq layer (mcp-json-get-string params "layer"))
   (if layer (progn (ensure_layer_exists layer "white" "CONTINUOUS") (set_current_layer layer)))
+  (setq has-uni (and text (vl-string-search "\\U+" text)))
+  (if has-uni
+    (progn (mcp-ensure-vn-style)
+           (setq old-style (getvar "TEXTSTYLE"))
+           (setvar "TEXTSTYLE" "MCP_VN")))
   (command "_MTEXT" (list x y 0.0) "_H" height "_W" width text "")
+  (if has-uni (setvar "TEXTSTYLE" old-style))
   (cons T (strcat "{\"entity_type\":\"MTEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
@@ -1072,7 +1173,7 @@
 (defun mcp-cmd-block-update-attribute (params / entity-id tag value ent)
   (setq entity-id (mcp-json-get-string params "entity_id"))
   (setq tag (mcp-json-get-string params "tag"))
-  (setq value (mcp-json-get-string params "value"))
+  (setq value (mcp-json-unescape (mcp-json-get-string params "value")))
   (if (= entity-id "last") (setq ent (entlast)) (setq ent (handent entity-id)))
   (if (not ent)
     (cons nil "Entity not found")
@@ -1138,7 +1239,7 @@
 )
 
 (defun mcp-cmd-create-leader (params / text pts-str pairs pt-str)
-  (setq text (mcp-json-get-string params "text"))
+  (setq text (mcp-json-unescape (mcp-json-get-string params "text")))
   (setq pts-str (mcp-json-get-string params "points_str"))
   (if (not pts-str)
     (cons nil "points_str required (format: x1,y1;x2,y2;...)")
@@ -1371,7 +1472,7 @@
 ;; Startup message
 ;; -----------------------------------------------------------------------
 
-(princ "\n=== MCP Dispatch v3.1 loaded ===")
+(princ "\n=== MCP Dispatch v3.2 loaded (Unicode text + batch) ===")
 (princ "\nIPC directory: ")
 (princ *mcp-ipc-dir*)
 (princ "\nReady for commands via (c:mcp-dispatch)")

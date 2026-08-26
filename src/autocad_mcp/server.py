@@ -1,6 +1,9 @@
-"""AutoCAD MCP Server v3.1 — 8 consolidated tools with operation dispatch.
+"""AutoCAD MCP Server v3.2 — 8 consolidated tools with operation dispatch.
 
 Tools: drawing, entity, layer, block, annotation, pid, view, system
+
+v3.2 adds: Unicode/Vietnamese text rendering, a batch operation (many commands
+in one undo group), and screenshot downscaling to cut token cost.
 """
 
 from __future__ import annotations
@@ -474,6 +477,13 @@ async def system(
       runtime       — Return process/runtime details for spawn diagnostics.
       init          — Re-initialize the backend.
       execute_lisp  — Execute arbitrary AutoLISP code (File IPC only). data: {code}
+      batch         — Run many commands in one round-trip + one UNDO group (File IPC only).
+                      data: {commands: [{command, params}, ...]}
+                      e.g. {"commands": [
+                        {"command": "create-line", "params": {"x1":0,"y1":0,"x2":100,"y2":0}},
+                        {"command": "create-text", "params": {"x":10,"y":10,"text":"Phòng ngủ","height":25}}
+                      ]}
+                      Far faster than one call per entity; use for bulk drawing.
     """
     data = data or {}
 
@@ -515,6 +525,13 @@ async def system(
             return _json({"error": "data.code is required"})
         result = await backend.execute_lisp(data["code"])
         return await add_screenshot_if_available(result, include_screenshot)
+    elif operation == "batch":
+        backend = await get_backend()
+        commands = data.get("commands")
+        if not commands:
+            return _json({"error": "data.commands (list) is required"})
+        result = await backend.batch(commands)
+        return await add_screenshot_if_available(result, include_screenshot)
     else:
         return _json({"error": f"Unknown system operation: {operation}"})
 
@@ -546,5 +563,5 @@ def main():
         ],
     )
 
-    log.info("autocad_mcp_starting", version="3.1.0")
+    log.info("autocad_mcp_starting", version="3.2.0")
     mcp.run(transport="stdio")
