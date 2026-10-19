@@ -83,7 +83,13 @@ class MatplotlibScreenshotProvider(ScreenshotProvider):
             fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.1)
             plt.close(fig)
             buf.seek(0)
-            return base64.b64encode(buf.read()).decode("ascii")
+
+            from PIL import Image
+
+            img = _downscale(Image.open(buf))
+            out_buf = io.BytesIO()
+            img.save(out_buf, format="PNG", optimize=True)
+            return base64.b64encode(out_buf.getvalue()).decode("ascii")
         except Exception as e:
             log.warning("matplotlib_screenshot_failed", error=str(e))
             return None

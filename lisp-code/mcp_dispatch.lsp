@@ -147,9 +147,11 @@
   )
 )
 
-(defun mcp-json-unescape (s / out i n ch nxt hex)
+(defun mcp-json-unescape (s mtext-p / out i n ch nxt hex)
   "Decode JSON string escapes for AutoCAD text.
-   Key fix: \\uXXXX (JSON, e.g. Vietnamese) -> \\U+XXXX (AutoCAD Unicode control code)."
+   Key fix: \\uXXXX (JSON, e.g. Vietnamese) -> \\U+XXXX (AutoCAD Unicode control code).
+   MTEXT-P non-nil targets MTEXT content, where a lone backslash starts a format
+   code: literal backslashes stay doubled and \\n becomes the \\P paragraph break."
   (if (null s) (setq s ""))
   (setq out "" i 1 n (strlen s))
   (while (<= i n)
@@ -162,12 +164,12 @@
            (setq hex (substr s (+ i 2) 4))
            (setq out (strcat out "\\U+" (strcase hex)))
            (setq i (+ i 6)))
-          ((= nxt "n") (setq out (strcat out " ")) (setq i (+ i 2)))
+          ((= nxt "n") (setq out (strcat out (if mtext-p "\\P" " "))) (setq i (+ i 2)))
           ((= nxt "t") (setq out (strcat out " ")) (setq i (+ i 2)))
           ((= nxt "r") (setq i (+ i 2)))
           ((= nxt "/") (setq out (strcat out "/")) (setq i (+ i 2)))
           ((= nxt "\"") (setq out (strcat out "\"")) (setq i (+ i 2)))
-          ((= nxt "\\") (setq out (strcat out "\\")) (setq i (+ i 2)))
+          ((= nxt "\\") (setq out (strcat out (if mtext-p "\\\\" "\\"))) (setq i (+ i 2)))
           (t (setq out (strcat out nxt)) (setq i (+ i 2)))
         )
       )
@@ -189,6 +191,42 @@
     )
   )
   "MCP_VN"
+)
+
+(defun mcp-has-unicode (text)
+  "T when TEXT contains an AutoCAD \\U+XXXX code (needs a TTF style to render)."
+  (and text (vl-string-search "\\U+" text) T)
+)
+
+(defun mcp-with-text-style (text fn args / has-uni old-style res)
+  "Apply FN to ARGS with the MCP_VN TTF style current when TEXT has Unicode.
+   The previous TEXTSTYLE is restored even if FN errors. Returns FN's result,
+   or the vl-catch-all error object (check with vl-catch-all-error-p)."
+  (setq has-uni (mcp-has-unicode text))
+  (if has-uni
+    (progn (mcp-ensure-vn-style)
+           (setq old-style (getvar "TEXTSTYLE"))
+           (setvar "TEXTSTYLE" "MCP_VN")))
+  (setq res (vl-catch-all-apply fn args))
+  (if has-uni (setvar "TEXTSTYLE" old-style))
+  res
+)
+
+(defun mcp-set-attrib-style (ent tag style / sub-ent ent-data)
+  "Point the ATTRIB with TAG on block insert ENT at text STYLE."
+  (setq sub-ent (entnext ent))
+  (while sub-ent
+    (setq ent-data (entget sub-ent))
+    (cond
+      ((and (= (cdr (assoc 0 ent-data)) "ATTRIB")
+            (= (strcase (cdr (assoc 2 ent-data))) (strcase tag)))
+       (entmod (subst (cons 7 style) (assoc 7 ent-data) ent-data))
+       (entupd sub-ent)
+       (setq sub-ent nil))
+      ((= (cdr (assoc 0 ent-data)) "SEQEND") (setq sub-ent nil))
+      (t (setq sub-ent (entnext sub-ent)))
+    )
+  )
 )
 
 ;; -----------------------------------------------------------------------
@@ -584,10 +622,10 @@
   (cons T (strcat "{\"entity_type\":\"LWPOLYLINE\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
-(defun mcp-cmd-create-text (params / x y text height rotation layer old-style has-uni)
+(defun mcp-cmd-create-text (params / x y text height rotation layer res)
   (setq x (mcp-json-get-number params "x"))
   (setq y (mcp-json-get-number params "y"))
-  (setq text (mcp-json-unescape (mcp-json-get-string params "text")))
+  (setq text (mcp-json-unescape (mcp-json-get-string params "text") nil))
   (setq height (mcp-json-get-number params "height"))
   (setq rotation (mcp-json-get-number params "rotation"))
   (if (not height) (setq height 2.5))
@@ -597,14 +635,11 @@
     (progn (ensure_layer_exists layer "white" "CONTINUOUS") (set_current_layer layer))
   )
   ;; Accented/Unicode text needs a TTF style to render (SHX fonts show "?").
-  (setq has-uni (and text (vl-string-search "\\U+" text)))
-  (if has-uni
-    (progn (mcp-ensure-vn-style)
-           (setq old-style (getvar "TEXTSTYLE"))
-           (setvar "TEXTSTYLE" "MCP_VN")))
-  (command "_TEXT" "J" "M" (list x y 0.0) height rotation text)
-  (if has-uni (setvar "TEXTSTYLE" old-style))
-  (cons T (strcat "{\"entity_type\":\"TEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
+  (setq res (mcp-with-text-style text 'command
+              (list "_TEXT" "J" "M" (list x y 0.0) height rotation text)))
+  (if (vl-catch-all-error-p res)
+    (cons nil (vl-catch-all-error-message res))
+    (cons T (strcat "{\"entity_type\":\"TEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}")))
 )
 
 (defun mcp-cmd-entity-count (params / layer count ent ent-data)
@@ -696,7 +731,7 @@
 
 ;; --- Batch execution (many commands, one UNDO group) ---
 
-(defun mcp-cmd-batch (params / batch-file fp line tab-pos cmd pjson res okc errc errs)
+(defun mcp-cmd-batch (params / batch-file fp line tab-pos cmd pjson res okc errc errs msg)
   "Run multiple whitelisted commands from a tab-delimited file in one UNDO group.
    Each line: <command-name>\t<params-json>. Reuses mcp-dispatch-command so the
    security whitelist still applies. Returns counts + a short error digest."
@@ -714,12 +749,18 @@
               (progn
                 (setq cmd (substr line 1 tab-pos))
                 (setq pjson (substr line (+ tab-pos 2)))
-                (setq res (vl-catch-all-apply 'mcp-dispatch-command (list cmd pjson)))
+                (setq res (if (= cmd "batch")
+                            (cons nil "nested batch not allowed")
+                            (vl-catch-all-apply 'mcp-dispatch-command (list cmd pjson))))
                 (if (or (vl-catch-all-error-p res) (null (car res)))
                   (progn
                     (setq errc (1+ errc))
-                    (if (< (strlen errs) 300)
-                      (setq errs (strcat errs (if (> (strlen errs) 0) "; " "") cmd))))
+                    (setq msg (if (vl-catch-all-error-p res)
+                                (vl-catch-all-error-message res)
+                                (vl-princ-to-string (cdr res))))
+                    (if (< (strlen errs) 500)
+                      (setq errs (strcat errs (if (> (strlen errs) 0) "; " "")
+                                         cmd ": " msg))))
                   (setq okc (1+ okc)))
               )
             )
@@ -905,23 +946,20 @@
   (cons T (strcat "{\"entity_type\":\"ELLIPSE\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
-(defun mcp-cmd-create-mtext (params / x y width text height layer old-style has-uni)
+(defun mcp-cmd-create-mtext (params / x y width text height layer res)
   (setq x (mcp-json-get-number params "x"))
   (setq y (mcp-json-get-number params "y"))
   (setq width (mcp-json-get-number params "width"))
-  (setq text (mcp-json-unescape (mcp-json-get-string params "text")))
+  (setq text (mcp-json-unescape (mcp-json-get-string params "text") T))
   (setq height (mcp-json-get-number params "height"))
   (if (not height) (setq height 2.5))
   (setq layer (mcp-json-get-string params "layer"))
   (if layer (progn (ensure_layer_exists layer "white" "CONTINUOUS") (set_current_layer layer)))
-  (setq has-uni (and text (vl-string-search "\\U+" text)))
-  (if has-uni
-    (progn (mcp-ensure-vn-style)
-           (setq old-style (getvar "TEXTSTYLE"))
-           (setvar "TEXTSTYLE" "MCP_VN")))
-  (command "_MTEXT" (list x y 0.0) "_H" height "_W" width text "")
-  (if has-uni (setvar "TEXTSTYLE" old-style))
-  (cons T (strcat "{\"entity_type\":\"MTEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
+  (setq res (mcp-with-text-style text 'command
+              (list "_MTEXT" (list x y 0.0) "_H" height "_W" width text "")))
+  (if (vl-catch-all-error-p res)
+    (cons nil (vl-catch-all-error-message res))
+    (cons T (strcat "{\"entity_type\":\"MTEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}")))
 )
 
 (defun mcp-cmd-create-hatch (params / entity-id pattern ent)
@@ -1173,17 +1211,19 @@
 (defun mcp-cmd-block-update-attribute (params / entity-id tag value ent)
   (setq entity-id (mcp-json-get-string params "entity_id"))
   (setq tag (mcp-json-get-string params "tag"))
-  (setq value (mcp-json-unescape (mcp-json-get-string params "value")))
+  (setq value (mcp-json-unescape (mcp-json-get-string params "value") nil))
   (if (= entity-id "last") (setq ent (entlast)) (setq ent (handent entity-id)))
   (if (not ent)
     (cons nil "Entity not found")
     (progn
       (if c:update-block-attribute
         (progn (c:update-block-attribute ent tag value)
+               (if (mcp-has-unicode value) (mcp-set-attrib-style ent tag (mcp-ensure-vn-style)))
                (cons T (strcat "{\"tag\":\"" tag "\",\"value\":\"" (mcp-escape-string value) "\"}")))
         ;; Inline fallback if attribute_tools.lsp not loaded
         (progn
           (set_attribute_value ent tag value)
+          (if (mcp-has-unicode value) (mcp-set-attrib-style ent tag (mcp-ensure-vn-style)))
           (cons T (strcat "{\"tag\":\"" tag "\",\"value\":\"" (mcp-escape-string value) "\"}")))
       )
     )
@@ -1238,20 +1278,28 @@
   (cons T "{\"entity_type\":\"DIMENSION\"}")
 )
 
-(defun mcp-cmd-create-leader (params / text pts-str pairs pt-str)
-  (setq text (mcp-json-unescape (mcp-json-get-string params "text")))
+(defun mcp-draw-leader (pts-str text / pairs pt-str)
+  "Run the LEADER command through PTS-STR points with TEXT as its annotation."
+  (command "_.LEADER")
+  (setq pairs (mcp-split-string pts-str ";"))
+  (foreach pt-str pairs
+    (command (list (atof (car (mcp-split-string pt-str ",")))
+                   (atof (cadr (mcp-split-string pt-str ","))) 0))
+  )
+  (command "" text "")
+)
+
+(defun mcp-cmd-create-leader (params / text pts-str res)
+  ;; Leader annotations are MTEXT, so use MTEXT escaping rules.
+  (setq text (mcp-json-unescape (mcp-json-get-string params "text") T))
   (setq pts-str (mcp-json-get-string params "points_str"))
   (if (not pts-str)
     (cons nil "points_str required (format: x1,y1;x2,y2;...)")
     (progn
-      (command "_.LEADER")
-      (setq pairs (mcp-split-string pts-str ";"))
-      (foreach pt-str pairs
-        (command (list (atof (car (mcp-split-string pt-str ",")))
-                       (atof (cadr (mcp-split-string pt-str ","))) 0))
-      )
-      (command "" text "")
-      (cons T "{\"entity_type\":\"LEADER\"}")
+      (setq res (mcp-with-text-style text 'mcp-draw-leader (list pts-str text)))
+      (if (vl-catch-all-error-p res)
+        (cons nil (vl-catch-all-error-message res))
+        (cons T "{\"entity_type\":\"LEADER\"}"))
     )
   )
 )

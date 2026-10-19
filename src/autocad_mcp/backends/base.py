@@ -21,6 +21,8 @@ class CommandResult:
             d["payload"] = self.payload
         else:
             d["error"] = self.error
+            if self.payload is not None:  # e.g. partial batch counts
+                d["payload"] = self.payload
         return d
 
 

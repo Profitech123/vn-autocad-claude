@@ -528,8 +528,8 @@ async def system(
     elif operation == "batch":
         backend = await get_backend()
         commands = data.get("commands")
-        if not commands:
-            return _json({"error": "data.commands (list) is required"})
+        if not isinstance(commands, list) or not commands:
+            return _json({"error": "data.commands (non-empty list) is required"})
         result = await backend.batch(commands)
         return await add_screenshot_if_available(result, include_screenshot)
     else:

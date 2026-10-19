@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -29,6 +30,10 @@ log = structlog.get_logger()
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
 STALE_THRESHOLD = 60.0  # clean up files older than this
+BATCH_PER_COMMAND_TIMEOUT = 0.5  # extra seconds allowed per batched command
+BATCH_MAX_TIMEOUT = 600.0  # hard cap for one batch round-trip
+# Dispatcher command names are lowercase words joined by hyphens (e.g. create-line).
+_COMMAND_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 def find_autocad_window() -> int | None:
@@ -62,6 +67,7 @@ class FileIPCBackend(AutoCADBackend):
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
         self._acad_com = None  # COM handle for full AutoCAD (preferred trigger)
+        self._com_capable = False  # True once COM has worked (full AutoCAD, not LT)
         self._lock = asyncio.Lock()  # Single in-flight command
 
     @property
@@ -138,12 +144,12 @@ class FileIPCBackend(AutoCADBackend):
 
     # --- IPC dispatch ---
 
-    async def _dispatch(self, command: str, params: dict) -> CommandResult:
+    async def _dispatch(self, command: str, params: dict, timeout: float | None = None) -> CommandResult:
         """Send a command via file IPC and wait for result."""
         async with self._lock:
-            return await self._dispatch_unlocked(command, params)
+            return await self._dispatch_unlocked(command, params, timeout)
 
-    async def _dispatch_unlocked(self, command: str, params: dict) -> CommandResult:
+    async def _dispatch_unlocked(self, command: str, params: dict, timeout: float | None = None) -> CommandResult:
         """Core IPC logic (must be called under _lock)."""
         request_id = uuid.uuid4().hex[:12]
         cmd_file = self._ipc_dir / f"autocad_mcp_cmd_{request_id}.json"
@@ -167,7 +173,7 @@ class FileIPCBackend(AutoCADBackend):
             self._type_dispatch_trigger()
 
             # Poll for result
-            deadline = time.time() + TIMEOUT
+            deadline = time.time() + (timeout or TIMEOUT)
             while time.time() < deadline:
                 if result_file.exists():
                     try:
@@ -228,10 +234,38 @@ class FileIPCBackend(AutoCADBackend):
             import win32com.client
 
             self._acad_com = win32com.client.GetActiveObject("AutoCAD.Application")
+            self._com_capable = True
             log.info("com_acquired", name=str(self._acad_com.Name))
         except Exception as e:
             self._acad_com = None
             log.info("com_unavailable", error=str(e))
+
+    def _send_com_trigger(self) -> bool:
+        """Send the trigger via COM; True on success.
+
+        Two ESCs (chr 27) first cancel any stale pending prompt, matching the
+        WM_CHAR path. A failure (e.g. RPC_E_CALL_REJECTED while AutoCAD is
+        busy, or a restarted AutoCAD) re-acquires the COM object and retries
+        once; COM stays the preferred path for later calls either way.
+        """
+        if self._acad_com is None and self._com_capable:
+            self._acquire_com()
+        for attempt in range(2):
+            if self._acad_com is None:
+                return False
+            try:
+                import pythoncom
+
+                pythoncom.CoInitialize()
+                self._acad_com.ActiveDocument.SendCommand("\x1b\x1b(c:mcp-dispatch) ")
+                return True
+            except Exception as e:
+                log.warning("com_dispatch_failed", error=str(e), attempt=attempt)
+                self._acad_com = None
+                if attempt == 0:
+                    time.sleep(0.2)
+                    self._acquire_com()
+        return False
 
     def _type_dispatch_trigger(self):
         """Trigger '(c:mcp-dispatch)' in AutoCAD.
@@ -241,16 +275,8 @@ class FileIPCBackend(AutoCADBackend):
         no COM automation interface.
         """
         # Preferred path: COM SendCommand (full AutoCAD)
-        if self._acad_com is not None:
-            try:
-                import pythoncom
-
-                pythoncom.CoInitialize()
-                self._acad_com.ActiveDocument.SendCommand("(c:mcp-dispatch) ")
-                return
-            except Exception as e:
-                log.error("com_dispatch_failed", error=str(e))
-                self._acad_com = None  # fall through to WM_CHAR
+        if self._send_com_trigger():
+            return
 
         # Fallback path: post keystrokes to the command line (AutoCAD LT)
         try:
@@ -350,32 +376,28 @@ class FileIPCBackend(AutoCADBackend):
         Commands are written to a tab-delimited file (one per line) and executed
         by the LISP 'batch' handler. json.dumps keeps text ASCII-safe (\\uXXXX),
         which the dispatcher decodes to AutoCAD Unicode.
+
+        The result is ok only if every command succeeded; the payload always
+        carries ok_count / error_count / errors.
         """
-        if not commands:
-            return CommandResult(ok=False, error="commands list is empty")
+        lines, error = build_batch_lines(commands)
+        if error:
+            return CommandResult(ok=False, error=error)
 
         request_id = uuid.uuid4().hex[:12]
         batch_file = self._ipc_dir / f"autocad_mcp_batch_{request_id}.txt"
-        lines = []
-        for c in commands:
-            cmd = c.get("command")
-            if not cmd:
-                continue
-            params = {k: v for k, v in (c.get("params") or {}).items() if v is not None}
-            # json.dumps has no literal tabs/newlines (they are escaped), so a
-            # tab is a safe field separator and one command == one line.
-            lines.append(f"{cmd}\t{json.dumps(params)}")
-
         batch_file.write_text("\n".join(lines), encoding="utf-8")
+        timeout = batch_timeout(len(lines))
         try:
-            return await self._dispatch("batch", {
-                "batch_file": str(batch_file).replace("\\", "/")
-            })
+            result = await self._dispatch(
+                "batch", {"batch_file": str(batch_file).replace("\\", "/")}, timeout=timeout
+            )
         finally:
             try:
                 batch_file.unlink(missing_ok=True)
             except OSError:
                 pass
+        return summarize_batch_result(result)
 
     # --- Entity operations ---
 
@@ -564,3 +586,58 @@ class FileIPCBackend(AutoCADBackend):
             if data:
                 return CommandResult(ok=True, payload=data)
         return CommandResult(ok=False, error="Screenshot capture failed")
+
+
+# --- Batch helpers (pure, unit-tested) ---
+
+
+def build_batch_lines(commands) -> tuple[list[str], str | None]:
+    """Validate batch items and encode them as '<command>\\t<params-json>' lines.
+
+    Returns (lines, None) on success or ([], error message) on invalid input.
+    """
+    if not isinstance(commands, list) or not commands:
+        return [], "commands must be a non-empty list"
+    lines: list[str] = []
+    problems: list[str] = []
+    for i, c in enumerate(commands):
+        if not isinstance(c, dict):
+            problems.append(f"#{i}: item must be an object")
+            continue
+        cmd = c.get("command")
+        if not isinstance(cmd, str) or not _COMMAND_NAME_RE.match(cmd):
+            problems.append(f"#{i}: invalid command name {cmd!r}")
+            continue
+        if cmd == "batch":
+            problems.append(f"#{i}: nested batch not allowed")
+            continue
+        raw_params = c.get("params") or {}
+        if not isinstance(raw_params, dict):
+            problems.append(f"#{i}: params must be an object")
+            continue
+        params = {k: v for k, v in raw_params.items() if v is not None}
+        # json.dumps escapes tabs/newlines, so one command == one line.
+        lines.append(f"{cmd}\t{json.dumps(params)}")
+    if problems:
+        return [], "invalid batch: " + "; ".join(problems)
+    return lines, None
+
+
+def batch_timeout(count: int) -> float:
+    """IPC timeout for a batch of `count` commands (base timeout + per-command budget)."""
+    return min(BATCH_MAX_TIMEOUT, TIMEOUT + BATCH_PER_COMMAND_TIMEOUT * count)
+
+
+def summarize_batch_result(result: CommandResult) -> CommandResult:
+    """Turn a batch payload with error_count > 0 into a failed result (payload kept)."""
+    payload = result.payload
+    if result.ok and isinstance(payload, dict) and payload.get("error_count", 0) > 0:
+        return CommandResult(
+            ok=False,
+            payload=payload,
+            error=(
+                f"{payload['error_count']} of {payload['error_count'] + payload.get('ok_count', 0)} "
+                f"batch commands failed: {payload.get('errors', '')}"
+            ),
+        )
+    return result
